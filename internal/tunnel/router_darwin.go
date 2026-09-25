@@ -148,6 +148,7 @@ func CleanupStaleRoutes(serverIP string) {
 		// Remove the split-default routes (0/1, 128/1) that we set up
 		run("route", "delete", "-net", "0.0.0.0/1")
 		run("route", "delete", "-net", "128.0.0.0/1")
+		unblockIPv6()
 
 		// Remove server host route if present
 		if serverIP != "" {
@@ -246,8 +247,19 @@ func SetupRoutes(serverIP, tunName, tunCIDR, customGW string, bypassIPs ...strin
 		return nil, "", fmt.Errorf("add route 128/1: %w", runErr)
 	}
 
+	// 3. The tunnel is IPv4-only: reject global IPv6 for the session so it
+	// cannot bypass the VPN on a network with native IPv6.
+	v6Blocked := true
+	if blockErr := blockIPv6(); blockErr != nil {
+		log.Printf("  [!] could not block IPv6, it may bypass the tunnel: %v", blockErr)
+		v6Blocked = false
+	}
+
 	gwInfo = fmt.Sprintf("%s (%s)", serverGW, gwSource)
 	cleanupFn := func() {
+		if v6Blocked {
+			unblockIPv6()
+		}
 		run("route", "delete", "-net", "128.0.0.0/1")
 		run("route", "delete", "-net", "0.0.0.0/1")
 		run("route", "delete", "-host", srvIP.String())
@@ -262,4 +274,28 @@ func SetupRoutes(serverIP, tunName, tunCIDR, customGW string, bypassIPs ...strin
 	}
 
 	return cleanupFn, gwInfo, nil
+}
+
+// ipv6Halves covers all of IPv6 with two /1 routes. They are more specific
+// than any default route but less specific than on-link prefixes, so the LAN
+// (link-local, ULA /64s) keeps working while everything else is blocked.
+var ipv6Halves = []string{"::/1", "8000::/1"}
+
+// blockIPv6 installs reject routes for ipv6Halves. -reject (not -blackhole)
+// makes connects fail at once, so apps fall back to IPv4 without a timeout.
+func blockIPv6() error {
+	for _, cidr := range ipv6Halves {
+		run("route", "-n", "delete", "-inet6", "-net", cidr) // stale from a crash
+		if err := run("route", "-n", "add", "-inet6", "-net", cidr, "::1", "-reject"); err != nil {
+			unblockIPv6()
+			return err
+		}
+	}
+	return nil
+}
+
+func unblockIPv6() {
+	for _, cidr := range ipv6Halves {
+		run("route", "-n", "delete", "-inet6", "-net", cidr)
+	}
 }

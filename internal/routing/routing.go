@@ -26,6 +26,18 @@ const (
 	stickyMarkMask  = "0xf0"
 	stickyTableBase = 101 // tunnel i → table 101+i
 	stickyChain     = "FTYB_SEL"
+
+	// outChain classifies transit-mode traffic (a local proxy's SO_MARK). OUTPUT
+	// jumps here once, matched on the proxy's original mark; the rules inside
+	// can then rewrite the mark freely without later rules losing the match.
+	outChain = "FTYB_OUT"
+
+	// fallbackMetric is the metric of the unreachable default route kept in
+	// every tunnel routing table. Tunnel routes use metric 0 and win while they
+	// exist; if they vanish (no tunnel up yet, tunnel device gone), tunnel-bound
+	// packets hit this route and are rejected instead of falling through to
+	// the main table and leaving via the ISP.
+	fallbackMetric = "4294967295"
 )
 
 func stickyMark(i int) string  { return fmt.Sprintf("0x%x", stickyMarkBase+i) }
@@ -168,17 +180,9 @@ func (m *Manager) Teardown() {
 
 	// Remove mangle rules — proxy-side (OUTPUT)
 	if m.outboundMark > 0 {
-		mark := fmt.Sprintf("0x%x", m.outboundMark)
-		run("iptables", "-t", "mangle", "-D", "OUTPUT",
-			"-m", "mark", "--mark", mark, "-j", "MARK", "--set-mark", MarkTunnel)
-		run("iptables", "-t", "mangle", "-D", "OUTPUT",
-			"-m", "mark", "--mark", mark,
-			"-m", "set", "--match-set", IPSetDirect, "dst",
-			"-j", "MARK", "--set-mark", MarkDirect)
-		run("iptables", "-t", "mangle", "-D", "OUTPUT",
-			"-m", "mark", "--mark", mark,
-			"-m", "set", "--match-set", IPSetProxy, "dst",
-			"-j", "MARK", "--set-mark", MarkTunnel)
+		run("iptables", transitJumpRule("-D", m.outboundMark)...)
+		run("iptables", "-t", "mangle", "-F", outChain)
+		run("iptables", "-t", "mangle", "-X", outChain)
 	}
 
 	// Remove NAT — one MASQUERADE per tunnel interface.
@@ -271,14 +275,26 @@ func stickySelectRules(marks []string) [][]string {
 	k := len(marks)
 	rules := make([][]string, 0, k+1)
 	for j, mark := range marks {
-		r := []string{"-t", "mangle", "-A", stickyChain, "-m", "mark", "--mark", "0x0/" + stickyMarkMask}
+		r := []string{"-A", stickyChain, "-m", "mark", "--mark", "0x0/" + stickyMarkMask}
 		if j < k-1 {
 			r = append(r, "-m", "statistic", "--mode", "nth", "--every", fmt.Sprintf("%d", k-j), "--packet", "0")
 		}
 		r = append(r, "-j", "MARK", "--set-mark", mark)
 		rules = append(rules, r)
 	}
-	return append(rules, []string{"-t", "mangle", "-A", stickyChain, "-j", "CONNMARK", "--save-mark"})
+	return append(rules, []string{"-A", stickyChain, "-j", "CONNMARK", "--save-mark"})
+}
+
+// stickyRestore renders the iptables-restore input that replaces the contents
+// of the selection chain in a single mangle-table commit.
+func stickyRestore(marks []string) string {
+	var b strings.Builder
+	b.WriteString("*mangle\n-F " + stickyChain + "\n")
+	for _, r := range stickySelectRules(marks) {
+		b.WriteString(strings.Join(r, " ") + "\n")
+	}
+	b.WriteString("COMMIT\n")
+	return b.String()
 }
 
 func stickyPinnedMatch() string {
@@ -324,6 +340,9 @@ func (m *Manager) setupStickyRouting() error {
 			if !strings.Contains(err.Error(), "exists") {
 				return err
 			}
+		}
+		if err := addFallbackRoute(table); err != nil {
+			return err
 		}
 		// Only pin the per-tunnel default route if the device exists — a dead
 		// upstream has no stunN yet. RebuildSticky re-installs it when the
@@ -397,10 +416,6 @@ func (m *Manager) RebuildSticky(active []string) error {
 		}
 	}
 
-	if err := run("iptables", "-t", "mangle", "-F", stickyChain); err != nil {
-		return fmt.Errorf("flush %s: %w", stickyChain, err)
-	}
-
 	k := len(active)
 	marks := make([]string, k)
 	for j, ifc := range active {
@@ -410,10 +425,12 @@ func (m *Manager) RebuildSticky(active []string) error {
 		}
 		marks[j] = stickyMark(idx)
 	}
-	for _, r := range stickySelectRules(marks) {
-		if err := run("iptables", r...); err != nil {
-			return err
-		}
+	// One iptables-restore transaction swaps the whole chain: a packet sees
+	// either the old selection or the new one, never an empty chain (which
+	// would leave it unmarked and send it out directly). On error nothing is
+	// applied and the previous selection stays in place.
+	if err := runStdin(stickyRestore(marks), "iptables-restore", "--noflush"); err != nil {
+		return fmt.Errorf("rebuild %s: %w", stickyChain, err)
 	}
 
 	m.activeIface = append([]string(nil), active...)
@@ -576,32 +593,40 @@ func (m *Manager) setupMangle() error {
 		}
 	}
 
-	// Source 2 (local proxy via SO_MARK): three rules in OUTPUT matched by mark.
-	// XRay (or any process) sets SO_MARK on its outbound sockets; we promote
-	// it to fwmark 0x1 (tunnel) by default, but flip to 0x0 (direct) for RU
-	// destinations and back to 0x1 for force-proxy destinations. The OUTPUT
-	// chain runs after the socket layer, so SO_MARK is visible there.
+	// Source 2 (local proxy via SO_MARK). XRay (or any process) sets SO_MARK
+	// on its outbound sockets; the OUTPUT chain runs after the socket layer, so
+	// the mark is visible there. OUTPUT jumps into outChain once, on the
+	// proxy's original mark, and the classification happens inside: tunnel by
+	// default, direct for RU destinations, tunnel again for force-proxy ones.
+	// Matching the original mark on every rule instead would break as soon as
+	// the first rule rewrites it.
 	if m.outboundMark > 0 {
-		mark := fmt.Sprintf("0x%x", m.outboundMark)
-		if err := run("iptables", "-t", "mangle", "-A", "OUTPUT",
-			"-m", "mark", "--mark", mark, "-j", "MARK", "--set-mark", MarkTunnel); err != nil {
-			return err
-		}
-		if err := run("iptables", "-t", "mangle", "-A", "OUTPUT",
-			"-m", "mark", "--mark", mark,
-			"-m", "set", "--match-set", IPSetDirect, "dst",
-			"-j", "MARK", "--set-mark", MarkDirect); err != nil {
-			return err
-		}
-		if err := run("iptables", "-t", "mangle", "-A", "OUTPUT",
-			"-m", "mark", "--mark", mark,
-			"-m", "set", "--match-set", IPSetProxy, "dst",
-			"-j", "MARK", "--set-mark", MarkTunnel); err != nil {
-			return err
+		run("iptables", "-t", "mangle", "-N", outChain) // may already exist
+		for _, s := range append(outChainRules(), transitJumpRule("-A", m.outboundMark)) {
+			if err := run("iptables", s...); err != nil {
+				return err
+			}
 		}
 	}
 
 	return nil
+}
+
+// outChainRules fills outChain (transit mode). Later rules override earlier
+// ones on purpose: tunnel by default, direct for RU, force-proxy wins.
+func outChainRules() [][]string {
+	return [][]string{
+		{"-t", "mangle", "-F", outChain},
+		{"-t", "mangle", "-A", outChain, "-j", "MARK", "--set-mark", MarkTunnel},
+		{"-t", "mangle", "-A", outChain, "-m", "set", "--match-set", IPSetDirect, "dst", "-j", "MARK", "--set-mark", MarkDirect},
+		{"-t", "mangle", "-A", outChain, "-m", "set", "--match-set", IPSetProxy, "dst", "-j", "MARK", "--set-mark", MarkTunnel},
+	}
+}
+
+// transitJumpRule is the single OUTPUT rule (op "-A" or "-D") that sends the
+// proxy's packets into outChain, matched on its original SO_MARK.
+func transitJumpRule(op string, outboundMark int) []string {
+	return []string{"-t", "mangle", op, "OUTPUT", "-m", "mark", "--mark", fmt.Sprintf("0x%x", outboundMark), "-j", outChain}
 }
 
 func (m *Manager) setupPolicyRouting() error {
@@ -610,6 +635,9 @@ func (m *Manager) setupPolicyRouting() error {
 		if !strings.Contains(err.Error(), "exists") {
 			return err
 		}
+	}
+	if err := addFallbackRoute(TableTunnel); err != nil {
+		return err
 	}
 
 	// Initial default route across only the tunnel devices that actually exist.
@@ -627,6 +655,17 @@ func (m *Manager) setupPolicyRouting() error {
 		return fmt.Errorf("install initial ECMP route: %w", err)
 	}
 
+	return nil
+}
+
+// addFallbackRoute installs the lowest-priority unreachable default route in a
+// tunnel routing table (see fallbackMetric). RebuildECMP / RebuildSticky
+// replace only the metric-0 default, so this one stays for the process
+// lifetime; Teardown removes it together with the table.
+func addFallbackRoute(table string) error {
+	if err := run("ip", "route", "replace", "unreachable", "default", "metric", fallbackMetric, "table", table); err != nil {
+		return fmt.Errorf("fallback route (table %s): %w", table, err)
+	}
 	return nil
 }
 
@@ -691,6 +730,17 @@ func (m *Manager) setupNAT() error {
 		}
 	}
 
+	return nil
+}
+
+// runStdin is run with input fed to the command's stdin.
+func runStdin(input, name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	cmd.Stdin = strings.NewReader(input)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s %s: %s: %w", name, strings.Join(args, " "), strings.TrimSpace(string(out)), err)
+	}
 	return nil
 }
 

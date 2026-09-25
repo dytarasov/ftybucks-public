@@ -4,7 +4,9 @@ package tunnel
 
 import (
 	"fmt"
+	"log"
 	"net"
+	"syscall"
 
 	"github.com/vishvananda/netlink"
 )
@@ -125,7 +127,16 @@ func SetupRoutes(serverIP, tunName, tunCIDR, customGW string, bypassIPs ...strin
 		return nil, "", fmt.Errorf("add tun route 128/1: %w", err)
 	}
 
+	// 3. The tunnel is IPv4-only: reject global IPv6 for the session so it
+	// cannot bypass the VPN on a network with native IPv6.
+	unblockV6, err := blockIPv6()
+	if err != nil {
+		log.Printf("  [!] could not block IPv6, it may bypass the tunnel: %v", err)
+		unblockV6 = func() {}
+	}
+
 	cleanupFn := func() {
+		unblockV6()
 		netlink.RouteDel(tunRoute2)
 		netlink.RouteDel(tunRoute1)
 		netlink.RouteDel(serverRoute)
@@ -142,4 +153,32 @@ func SetupRoutes(serverIP, tunName, tunCIDR, customGW string, bypassIPs ...strin
 	}
 
 	return cleanupFn, gwInfo, nil
+}
+
+// ipv6Halves covers all of IPv6 with two /1 routes. They are more specific
+// than any default route but less specific than on-link prefixes, so the LAN
+// (link-local, ULA /64s) keeps working while everything else is blocked.
+var ipv6Halves = []string{"::/1", "8000::/1"}
+
+// blockIPv6 installs unreachable routes for ipv6Halves and returns a function
+// that removes them. Unreachable rather than blackhole: apps get an immediate
+// error and fall back to IPv4 instead of waiting for a timeout. RouteReplace
+// keeps it idempotent if a crashed session left the routes behind.
+func blockIPv6() (func(), error) {
+	var added []*netlink.Route
+	undo := func() {
+		for _, r := range added {
+			netlink.RouteDel(r)
+		}
+	}
+	for _, cidr := range ipv6Halves {
+		_, dst, _ := net.ParseCIDR(cidr)
+		r := &netlink.Route{Dst: dst, Type: syscall.RTN_UNREACHABLE}
+		if err := netlink.RouteReplace(r); err != nil {
+			undo()
+			return nil, fmt.Errorf("add unreachable %s: %w", cidr, err)
+		}
+		added = append(added, r)
+	}
+	return undo, nil
 }
