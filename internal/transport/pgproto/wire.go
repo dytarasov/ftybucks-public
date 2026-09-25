@@ -56,6 +56,14 @@ const (
 // SSLRequest code (special startup message).
 const sslRequestCode = 80877103
 
+// Single-byte replies to SSLRequest. Real PostgreSQL answers 'S' to accept TLS
+// and 'N' to refuse. Early builds of this server sent 'Y', a byte no genuine
+// server ever sends, so clients still accept it while old nodes are upgraded.
+const (
+	sslAccepted       = 'S'
+	sslAcceptedLegacy = 'Y'
+)
+
 // GSSENCRequest and CancelRequest codes.
 const (
 	gssEncRequestCode  = 80877104

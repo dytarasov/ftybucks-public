@@ -258,6 +258,29 @@ func (m *Manager) RebuildECMP(active []string) error {
 }
 
 // stickyPinnedMatch is the "flow already pinned to some tunnel" mark match.
+// stickySelectRules returns the FTYB_SEL rules that spread NEW flows evenly
+// across marks and save the pick to conntrack.
+//
+// MARK does not terminate the chain, so without a guard every later rule would
+// overwrite the pick and all flows would land on the last tunnel. Each rule
+// therefore only matches packets whose sticky bits are still unset. The mark
+// match comes before the statistic match, so a rule's nth counter only sees
+// the flows no earlier rule took: rule j takes 1/(k-j) of what is left, which
+// gives an even split.
+func stickySelectRules(marks []string) [][]string {
+	k := len(marks)
+	rules := make([][]string, 0, k+1)
+	for j, mark := range marks {
+		r := []string{"-t", "mangle", "-A", stickyChain, "-m", "mark", "--mark", "0x0/" + stickyMarkMask}
+		if j < k-1 {
+			r = append(r, "-m", "statistic", "--mode", "nth", "--every", fmt.Sprintf("%d", k-j), "--packet", "0")
+		}
+		r = append(r, "-j", "MARK", "--set-mark", mark)
+		rules = append(rules, r)
+	}
+	return append(rules, []string{"-t", "mangle", "-A", stickyChain, "-j", "CONNMARK", "--save-mark"})
+}
+
 func stickyPinnedMatch() string {
 	return fmt.Sprintf("0x%x/%s", stickyMarkBase, stickyMarkMask)
 }
@@ -379,30 +402,18 @@ func (m *Manager) RebuildSticky(active []string) error {
 	}
 
 	k := len(active)
+	marks := make([]string, k)
 	for j, ifc := range active {
 		idx, ok := m.ifaceIdx[ifc]
 		if !ok {
 			return fmt.Errorf("unknown tunnel iface %q", ifc)
 		}
-		mark := stickyMark(idx)
-		if j < k-1 {
-			// nth --every (k-j) selects 1/(k-j) of the packets reaching this
-			// rule; chaining gives an even split across the active set.
-			every := fmt.Sprintf("%d", k-j)
-			if err := run("iptables", "-t", "mangle", "-A", stickyChain,
-				"-m", "statistic", "--mode", "nth", "--every", every, "--packet", "0",
-				"-j", "MARK", "--set-mark", mark); err != nil {
-				return err
-			}
-		} else {
-			if err := run("iptables", "-t", "mangle", "-A", stickyChain,
-				"-j", "MARK", "--set-mark", mark); err != nil {
-				return err
-			}
-		}
+		marks[j] = stickyMark(idx)
 	}
-	if err := run("iptables", "-t", "mangle", "-A", stickyChain, "-j", "CONNMARK", "--save-mark"); err != nil {
-		return err
+	for _, r := range stickySelectRules(marks) {
+		if err := run("iptables", r...); err != nil {
+			return err
+		}
 	}
 
 	m.activeIface = append([]string(nil), active...)

@@ -2,6 +2,7 @@ package pgproto
 
 import (
 	"crypto/tls"
+	"io"
 	"net"
 	"testing"
 )
@@ -162,5 +163,29 @@ func TestHandshakeTLS(t *testing.T) {
 	}
 	if string(buf[:n]) != string(testData) {
 		t.Fatalf("got %q, want %q", buf[:n], testData)
+	}
+}
+
+// TestServerSSLReplyMatchesPostgres checks the server against the PostgreSQL
+// protocol spec rather than against our own client: the reply to SSLRequest is
+// sent in cleartext, so any byte other than 'S' marks the server as not-PG.
+func TestServerSSLReplyMatchesPostgres(t *testing.T) {
+	cert := generateTestCert(t)
+	clientConn, serverConn := tcpPipe(t)
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	go ServerHandshake(serverConn, []byte("psk"), cert)
+
+	// SSLRequest exactly as libpq sends it: int32 length 8, int32 code 80877103.
+	if _, err := clientConn.Write([]byte{0x00, 0x00, 0x00, 0x08, 0x04, 0xd2, 0x16, 0x2f}); err != nil {
+		t.Fatalf("write SSLRequest: %v", err)
+	}
+	var reply [1]byte
+	if _, err := io.ReadFull(clientConn, reply[:]); err != nil {
+		t.Fatalf("read reply: %v", err)
+	}
+	if reply[0] != 'S' {
+		t.Fatalf("SSLRequest reply = %q, PostgreSQL sends 'S'", reply[0])
 	}
 }

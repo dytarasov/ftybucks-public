@@ -96,12 +96,13 @@ func ClientHandshake(conn net.Conn, psk []byte) (*PGConn, error) {
 		return nil, fmt.Errorf("send ssl request: %w", err)
 	}
 
-	// 2. Read 1 byte — expect 'Y'
+	// 2. Read 1 byte — expect 'S' (PostgreSQL's "SSL accepted"). 'Y' is what
+	// servers built before the fix sent; accept it until every node is upgraded.
 	var sslResp [1]byte
 	if _, err := io.ReadFull(conn, sslResp[:]); err != nil {
 		return nil, fmt.Errorf("read ssl response: %w", err)
 	}
-	if sslResp[0] != 'Y' {
+	if sslResp[0] != sslAccepted && sslResp[0] != sslAcceptedLegacy {
 		return nil, fmt.Errorf("server rejected SSL (got %c)", sslResp[0])
 	}
 
@@ -241,8 +242,8 @@ func ServerHandshake(conn net.Conn, psk []byte, cert tls.Certificate) (*PGConn, 
 	for protoVer == sslRequestCode || protoVer == gssEncRequestCode || protoVer == cancelRequestCode {
 		switch protoVer {
 		case sslRequestCode:
-			// Respond 'Y' and upgrade to TLS
-			if _, err := conn.Write([]byte{'Y'}); err != nil {
+			// Respond 'S' (as real PostgreSQL does) and upgrade to TLS
+			if _, err := conn.Write([]byte{sslAccepted}); err != nil {
 				return nil, fmt.Errorf("send ssl accept: %w", err)
 			}
 			tlsConn := tls.Server(conn, serverTLSConfig(cert))

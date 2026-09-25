@@ -350,6 +350,11 @@ func (m *Manager) generateClientConfig(p Peer) string {
 	// everything via AllowedIPs=0.0.0.0/0. A /24 here would wrongly mark the
 	// whole tunnel subnet as on-link on the client.
 	//
+	// ::/0 is there to stop IPv6 leaks, not to carry IPv6: the tunnel is
+	// IPv4-only, so without it a client with native IPv6 would send v6 traffic
+	// around the tunnel. With it, v6 packets enter wg0 and the gateway drops
+	// them (the peer's allowed IP is a v4 /32), and apps fall back to IPv4.
+	//
 	// MTU 1380 leaves headroom for the full encapsulation chain (WG + the
 	// PG/TLS/TCP tunnel) and matches the gateway/server MSS clamp, so large
 	// transfers and QUIC don't stall on oversized packets being dropped.
@@ -362,7 +367,7 @@ MTU = 1380
 [Peer]
 PublicKey = %s
 Endpoint = %s:%d
-AllowedIPs = 0.0.0.0/0
+AllowedIPs = 0.0.0.0/0, ::/0
 PersistentKeepalive = 25
 `, p.PrivateKey, strings.TrimSuffix(p.AllowedIP, "/32"), dns, m.serverPub, endpoint, port)
 }

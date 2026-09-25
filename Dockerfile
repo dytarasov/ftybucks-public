@@ -14,7 +14,6 @@ FROM alpine:3.21
 RUN apk add --no-cache iptables iproute2
 
 COPY --from=builder /src/bin/shadowtunnel-server /usr/local/bin/shadowtunnel-server
-COPY configs/server.yaml /etc/shadowtunnel/server.yaml
 
 EXPOSE 5432
 
