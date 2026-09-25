@@ -1,0 +1,6 @@
+listen: "0.0.0.0:5432"
+tun_cidr: "10.7.0.1/24"
+psk: "<base64-encoded-32-byte-key>"  # generate: openssl rand -base64 32
+padding:
+  min: 0
+  max: 64

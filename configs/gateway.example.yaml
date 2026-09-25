@@ -1,0 +1,72 @@
+tunnel:
+  # Single upstream:
+  # server: "<abroad-server-ip>:5432"
+
+  # Multi-upstream pool with failover + ECMP load balancing.
+  # Each entry becomes an independent VPN session with its own TUN device
+  # ("stunN" where N is the index). Linux ECMP hashes flows across the
+  # healthy subset; failed peers are automatically evicted.
+  servers:
+    - "<abroad-server-1>:5432"
+    - "<abroad-server-2>:5432"
+    - "<abroad-server-3>:5432"
+
+  psk: "<same-psk-as-server>"
+  tun_name: "stun"   # device prefix: stun0, stun1, ...
+  jitter_ms: 0
+  padding:
+    min: 0
+    max: 64
+
+  # How flows are steered across the upstream pool:
+  #   ecmp           - kernel ECMP across all healthy tunnels (legacy default).
+  #                    Fast, but any peer flap rehashes live flows onto a
+  #                    different exit IP and breaks them ("hangs, then works").
+  #   ecmp-sticky    - ECMP for new flows, but each flow is pinned to its tunnel
+  #                    in conntrack (CONNMARK). Evicting/re-adding a peer no
+  #                    longer disturbs flows on the surviving tunnels. Best of
+  #                    both (throughput + stability). WireGuard ingress only.
+  #   active-standby - all flows use one primary tunnel; fail over to the next
+  #                    healthy peer only when the primary drops. No rehash at all
+  #                    while the primary is up. Most stable; single-path throughput.
+  routing_mode: "ecmp-sticky"
+
+wireguard:
+  listen_port: 51820
+  interface: "wg0"
+  address: "10.8.0.1/24"
+  subnet: "10.8.0.0/24"
+  dns: "1.1.1.1"
+  peers_file: "/etc/gateway/peers.yaml"
+
+geoip:
+  database_path: "/var/lib/geoip/dbip-country-lite.mmdb"
+  update_interval: "720h"
+  country_code: "RU"
+
+exceptions:
+  # Force through tunnel (even if GeoIP says RU)
+  - domain: "youtube.com"
+    direction: "proxy"
+  - domain: "googlevideo.com"
+    direction: "proxy"
+
+  # Force direct (even if GeoIP says not RU)
+  - domain: "vk.com"
+    direction: "direct"
+
+  # Telegram — force through tunnel
+  - cidr: "149.154.160.0/20"
+    direction: "proxy"
+  - cidr: "91.108.4.0/22"
+    direction: "proxy"
+  - cidr: "91.108.8.0/22"
+    direction: "proxy"
+  - cidr: "91.108.12.0/22"
+    direction: "proxy"
+  - cidr: "91.108.16.0/22"
+    direction: "proxy"
+  - cidr: "91.108.20.0/22"
+    direction: "proxy"
+  - cidr: "91.108.56.0/22"
+    direction: "proxy"

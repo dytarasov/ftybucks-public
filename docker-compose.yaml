@@ -1,0 +1,20 @@
+services:
+  shadowtunnel:
+    build: .
+    container_name: shadowtunnel-server
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv4.ip_forward=1
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./configs/server.yaml:/etc/shadowtunnel/server.yaml:ro
+      - ftybucks-tls:/etc/ftybucks
+
+volumes:
+  ftybucks-tls:

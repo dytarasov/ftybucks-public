@@ -1,0 +1,28 @@
+bin/
+build/
+*.exe
+.DS_Store
+.idea/
+.claude/
+
+# Compiled binaries at root
+/client
+/server
+/gateway
+/tray
+/test-dial
+
+# Configs with real secrets (use *.example.yaml as template)
+configs/server.yaml
+configs/client.yaml
+configs/gateway.yaml
+peers.yaml
+
+# GeoIP database
+*.mmdb
+
+# Xcode user data
+xcuserdata/
+*.xcuserstate
+.ssh/
+*.pem
